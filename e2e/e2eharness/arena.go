@@ -246,6 +246,123 @@ func ArenaTeamRating(t *testing.T, charDB *sql.DB, teamID uint32) uint32 {
 	return rating
 }
 
+// ArenaSlotForTeamType maps an arena team type to the slot the DB and the queue index by
+// (ArenaTeam::ArenaSlotByType: 2v2 -> 0, 3v3 -> 1, 5v5 -> 2). A module can remap this
+// through the OnGetSlotByType hook, so a realm running one is out of scope here.
+func ArenaSlotForTeamType(t *testing.T, teamType client.ArenaTeamType) client.ArenaSlot {
+	t.Helper()
+	switch teamType {
+	case client.ArenaTeam2v2:
+		return client.ArenaSlot2v2
+	case client.ArenaTeam3v3:
+		return client.ArenaSlot3v3
+	case client.ArenaTeam5v5:
+		return client.ArenaSlot5v5
+	}
+	HarnessFailf(t, "no arena slot for team type %d", teamType)
+	return 0
+}
+
+// SeedMatchmakerRating fixes the matchmaker rating a character brings into an arena team.
+//
+// This is the only lever on it. No GM command sets a team's rating, and writing arena_team
+// does not reach a team already live in sArenaTeamMgr. ArenaTeam::AddMember reads
+// character_arena_stats with a synchronous query and only falls back to
+// Arena.ArenaStartMatchmakerRating when there is no row, so the value is picked up with no
+// config change and no reload.
+//
+// Seed every member BEFORE CreateArenaTeam. AddMember reads the row once, as the member
+// joins, and never looks at it again. It takes the same team type as CreateArenaTeam so the
+// two cannot disagree about which bracket is being set up.
+//
+// The queue pairs on ArenaTeam::GetAverageMMR, which averages the online party members, so
+// give both members of one team the same rating.
+//
+// The row is removed on cleanup: it is keyed on the character guid alone, so leaving it
+// behind would hand the rating to whoever inherits that guid next.
+//
+// Two mistakes are caught here because nothing downstream can catch them. AddMember keeps
+// the rating in memory and CHAR_INS_ARENA_TEAM_MEMBER has no matchMakerRating column, so it
+// only reaches the DB through ArenaTeam::SaveToDB after a match, and a seed that did not
+// apply leaves every team on the config default: the same rating for all of them, which a
+// caller comparing the ratings it *intended* would read as a real spread. So the write is
+// read back, which also catches a rating maxMMR cannot hold as a signed smallint, and
+// seeding a character that is already on a team for this bracket is refused rather than
+// silently having no effect.
+func SeedMatchmakerRating(t *testing.T, bot *ScenarioBot, teamType client.ArenaTeamType, rating uint16) {
+	t.Helper()
+	slot := ArenaSlotForTeamType(t, teamType)
+
+	var joined int
+	if err := bot.CharDB.QueryRow(
+		`SELECT COUNT(*) FROM arena_team_member m JOIN arena_team t ON t.arenaTeamId = m.arenaTeamId
+		 WHERE m.guid = ? AND t.type = ?`, bot.GUID, uint8(teamType)).Scan(&joined); err != nil {
+		HarnessFailf(t, "check %s for an existing %dv%d team: %v", bot.Name, teamType, teamType, err)
+	}
+	if joined > 0 {
+		HarnessFailf(t, "%s is already on a %dv%d team, so seeding now cannot change its "+
+			"matchmaker rating: AddMember read character_arena_stats when the team was formed. "+
+			"Seed before CreateArenaTeam.", bot.Name, teamType, teamType)
+	}
+
+	if _, err := bot.CharDB.Exec(
+		`REPLACE INTO character_arena_stats (guid, slot, matchMakerRating, maxMMR) VALUES (?, ?, ?, ?)`,
+		bot.GUID, uint8(slot), rating, rating); err != nil {
+		HarnessFailf(t, "seed matchmaker rating %d for %s (guid %d, slot %d): %v",
+			rating, bot.Name, bot.GUID, slot, err)
+	}
+	t.Cleanup(func() {
+		if _, err := bot.CharDB.Exec(
+			`DELETE FROM character_arena_stats WHERE guid = ? AND slot = ?`,
+			bot.GUID, uint8(slot)); err != nil {
+			t.Logf("clear matchmaker rating for %s: %v", bot.Name, err)
+		}
+	})
+
+	if got := MatchmakerRating(t, bot.CharDB, bot.GUID, teamType); got != rating {
+		HarnessFailf(t, "seeded matchmaker rating %d for %s (guid %d, slot %d) but read back %d",
+			rating, bot.Name, bot.GUID, slot, got)
+	}
+	t.Logf("seeded matchmaker rating %d for %s (guid %d, slot %d)", rating, bot.Name, bot.GUID, slot)
+}
+
+// MatchmakerRating reads the seeded character_arena_stats rating, or 0 when the character
+// has no row and ArenaTeam::AddMember would fall back to Arena.ArenaStartMatchmakerRating.
+func MatchmakerRating(t *testing.T, charDB *sql.DB, charGUID uint64, teamType client.ArenaTeamType) uint16 {
+	t.Helper()
+	slot := ArenaSlotForTeamType(t, teamType)
+
+	var rating uint16
+	err := charDB.QueryRow(
+		`SELECT matchMakerRating FROM character_arena_stats WHERE guid = ? AND slot = ?`,
+		charGUID, uint8(slot)).Scan(&rating)
+	if err == sql.ErrNoRows {
+		return 0
+	}
+	if err != nil {
+		HarnessFailf(t, "read matchmaker rating (guid %d, slot %d): %v", charGUID, slot, err)
+	}
+	return rating
+}
+
+// DrainArenaQueueOnCleanup takes every bot out of its bracket when the test ends.
+//
+// An invited group is only erased once its last member is gone, so a bot left queued keeps
+// the rated bracket occupied until its invite expires, and the next test pairs against it
+// instead of against its own teams. Disbanding the team gets there too, but only once the
+// server has processed it, which can be after the next test has already queued.
+//
+// Register this AFTER the teams exist. Cleanups run last registered first, so registering
+// it later makes it drain before CreateArenaTeam's disband rather than after.
+func DrainArenaQueueOnCleanup(t *testing.T, bots []*ScenarioBot) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, b := range bots {
+			b.LeaveBattlefieldQueue(t)
+		}
+	})
+}
+
 // TeleportToArenaBattlemaster places every bot at one Arena Battlemaster spawn and
 // returns that unit's live ObjectGuid, which is the same for every bot.
 //
